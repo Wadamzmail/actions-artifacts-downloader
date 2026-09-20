@@ -23,10 +23,15 @@ permissions:
 
 jobs:
   send-artifact:
-    name: Download and send artifact
+    name: Download, split and send artifact
     runs-on: ubuntu-latest
 
     steps:
+      - name: Install 7-Zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
       - name: Parse run URL
         id: run
         env:
@@ -83,11 +88,14 @@ jobs:
 
           if [[ -z "$ARTIFACT_ID" ]]; then
             echo "::error::Artifact '$ARTIFACT_NAME' was not found or is expired."
+
             echo
             echo "Available artifacts:"
 
             echo "$ARTIFACTS" |
-              jq -r '.artifacts[] | "  - \(.name) (expired=\(.expired))"'
+              jq -r \
+                '.artifacts[]
+                 | "  - \(.name) (expired=\(.expired))"'
 
             exit 1
           fi
@@ -105,27 +113,78 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p artifact
+          mkdir -p download
 
           echo "Downloading artifact..."
 
           gh api \
             --method GET \
             "/repos/$OWNER/$REPO/actions/artifacts/$ARTIFACT_ID/zip" \
-            > artifact/artifact.zip
+            > download/artifact.zip
 
-          echo "Downloaded:"
-          ls -lh artifact/artifact.zip
+          echo "Downloaded artifact:"
+          ls -lh download/artifact.zip
 
-      - name: Show artifact contents
+      - name: Extract artifact ZIP
         run: |
           set -euo pipefail
 
-          echo "Artifact contents:"
+          mkdir -p extracted
 
-          unzip -l artifact/artifact.zip
+          echo "Extracting artifact..."
 
-      - name: Send artifact to Telegram
+          unzip -q \
+            download/artifact.zip \
+            -d extracted
+
+          echo
+          echo "Extracted files:"
+          find extracted \
+            -type f \
+            -printf '%p\n'
+
+      - name: Create split 7z archive
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p parts
+
+          echo "Creating 45 MB multi-volume archive..."
+
+          7z a \
+            -v45m \
+            -mx=0 \
+            "parts/${ARTIFACT_NAME}.7z" \
+            ./extracted/*
+
+          echo
+          echo "Generated parts:"
+          ls -lh parts/
+
+      - name: Verify generated parts
+        run: |
+          set -euo pipefail
+
+          PART_COUNT="$(
+            find parts \
+              -maxdepth 1 \
+              -type f \
+              -name '*.7z.*' |
+            wc -l
+          )"
+
+          if [[ "$PART_COUNT" -eq 0 ]]; then
+            echo "::error::No archive parts were created."
+            exit 1
+          fi
+
+          echo "Created $PART_COUNT parts."
+
+          ls -lh parts/
+
+      - name: Send parts to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
@@ -138,33 +197,55 @@ jobs:
             exit 1
           fi
 
-          FILE="artifact/artifact.zip"
+          mapfile -t PARTS < <(
+            find parts \
+              -maxdepth 1 \
+              -type f \
+              -name '*.7z.*' |
+            sort -V
+          )
 
-          echo "Sending artifact to Telegram..."
+          TOTAL="${#PARTS[@]}"
 
-          RESPONSE="$(
-            curl \
-              --fail-with-body \
-              --silent \
-              --show-error \
-              --request POST \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-              --form "chat_id=${TELEGRAM_CHAT_ID}" \
-              --form "document=@${FILE}" \
-              --form "caption=📦 ${ARTIFACT_NAME}"
-          )"
+          echo "Sending $TOTAL parts..."
 
-          echo "$RESPONSE" |
-            jq .
+          for INDEX in "${!PARTS[@]}"; do
+            FILE="${PARTS[$INDEX]}"
+            NUMBER=$((INDEX + 1))
 
-          OK="$(
+            echo
+            echo "Sending part $NUMBER/$TOTAL:"
+            echo "$FILE"
+
+            RESPONSE="$(
+              curl \
+                --fail-with-body \
+                --silent \
+                --show-error \
+                --request POST \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                --form "chat_id=${TELEGRAM_CHAT_ID}" \
+                --form "document=@${FILE}" \
+                --form "caption=📦 ${ARTIFACT_NAME} — part ${NUMBER}/${TOTAL}"
+            )"
+
             echo "$RESPONSE" |
-              jq -r '.ok'
-          )"
+              jq .
 
-          if [[ "$OK" != "true" ]]; then
-            echo "::error::Telegram failed to send the artifact."
-            exit 1
-          fi
+            OK="$(
+              echo "$RESPONSE" |
+                jq -r '.ok'
+            )"
 
-          echo "✅ Artifact sent successfully."
+            if [[ "$OK" != "true" ]]; then
+              echo "::error::Telegram failed to send part $NUMBER."
+              exit 1
+            fi
+
+            echo "✅ Part $NUMBER/$TOTAL sent."
+
+            sleep 1
+          done
+
+          echo
+          echo "🎉 All parts sent successfully."
