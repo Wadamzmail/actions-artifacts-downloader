@@ -1,0 +1,170 @@
+name: Send Artifact to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_url:
+        description: "GitHub Actions run URL"
+        required: true
+        type: string
+
+      artifact_name:
+        description: "Artifact name"
+        required: true
+        type: string
+
+      chat_id:
+        description: "Telegram chat ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+
+jobs:
+  send-artifact:
+    name: Download and send artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Parse run URL
+        id: run
+        env:
+          RUN_URL: ${{ inputs.run_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$RUN_URL" =~ ^https://github\.com/([^/]+)/([^/]+)/actions/runs/([0-9]+) ]]; then
+            OWNER="${BASH_REMATCH[1]}"
+            REPO="${BASH_REMATCH[2]}"
+            RUN_ID="${BASH_REMATCH[3]}"
+          else
+            echo "::error::Invalid GitHub Actions run URL"
+            exit 1
+          fi
+
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          echo "Repository: $OWNER/$REPO"
+          echo "Run ID: $RUN_ID"
+
+      - name: Find artifact
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ steps.run.outputs.owner }}
+          REPO: ${{ steps.run.outputs.repo }}
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+
+          echo "Looking for artifact:"
+          echo "$ARTIFACT_NAME"
+
+          ARTIFACTS="$(
+            gh api \
+              "/repos/$OWNER/$REPO/actions/runs/$RUN_ID/artifacts" \
+              --paginate
+          )"
+
+          ARTIFACT_ID="$(
+            echo "$ARTIFACTS" |
+              jq -r \
+                --arg NAME "$ARTIFACT_NAME" \
+                '.artifacts[]
+                 | select(.name == $NAME)
+                 | select(.expired == false)
+                 | .id' |
+              head -n 1
+          )"
+
+          if [[ -z "$ARTIFACT_ID" ]]; then
+            echo "::error::Artifact '$ARTIFACT_NAME' was not found or is expired."
+            echo
+            echo "Available artifacts:"
+
+            echo "$ARTIFACTS" |
+              jq -r '.artifacts[] | "  - \(.name) (expired=\(.expired))"'
+
+            exit 1
+          fi
+
+          echo "artifact_id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+
+          echo "Found artifact ID: $ARTIFACT_ID"
+
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ steps.run.outputs.owner }}
+          REPO: ${{ steps.run.outputs.repo }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p artifact
+
+          echo "Downloading artifact..."
+
+          gh api \
+            --method GET \
+            "/repos/$OWNER/$REPO/actions/artifacts/$ARTIFACT_ID/zip" \
+            > artifact/artifact.zip
+
+          echo "Downloaded:"
+          ls -lh artifact/artifact.zip
+
+      - name: Show artifact contents
+        run: |
+          set -euo pipefail
+
+          echo "Artifact contents:"
+
+          unzip -l artifact/artifact.zip
+
+      - name: Send artifact to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ inputs.chat_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is not configured."
+            exit 1
+          fi
+
+          FILE="artifact/artifact.zip"
+
+          echo "Sending artifact to Telegram..."
+
+          RESPONSE="$(
+            curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --request POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              --form "chat_id=${TELEGRAM_CHAT_ID}" \
+              --form "document=@${FILE}" \
+              --form "caption=📦 ${ARTIFACT_NAME}"
+          )"
+
+          echo "$RESPONSE" |
+            jq .
+
+          OK="$(
+            echo "$RESPONSE" |
+              jq -r '.ok'
+          )"
+
+          if [[ "$OK" != "true" ]]; then
+            echo "::error::Telegram failed to send the artifact."
+            exit 1
+          fi
+
+          echo "✅ Artifact sent successfully."
